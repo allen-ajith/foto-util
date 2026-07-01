@@ -1,0 +1,38 @@
+[project]
+name = "foto-util"
+version = "0.1.0"
+description = "Fast, local, keyboard-driven photo culling for Sony RAW+JPEG cards. Non-destructive; never alters the card's structure."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Allen Ajith" }]
+dependencies = [
+    "PySide6>=6.6",
+    "xxhash>=3.4",
+    "piexif>=1.1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+foto-util = "foto_util.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/allen-ajith/foto-util"
+Repository = "https://github.com/allen-ajith/foto-util"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/foto_util"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
