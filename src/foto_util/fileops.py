@@ -42,6 +42,12 @@ class VerificationError(Exception):
     """The trash copy did not match the original (size or content hash)."""
 
 
+class RestoreConflictError(Exception):
+    """The restore destination already holds a *different* file. Restoring would
+    destroy it (there is no staging on the way back to the card), so the restore
+    is refused and both files are left untouched."""
+
+
 # -- low-level durability helpers ------------------------------------------
 def _fsync_file(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
@@ -143,7 +149,9 @@ def restore(trash_path: str | Path, original_path: str | Path) -> Path:
     Verifies the restored bytes match the trash copy before removing the trash
     copy, so a crash mid-restore never loses the image. Idempotent: if the
     original already exists with a matching hash, the trash copy is simply
-    cleaned up.
+    cleaned up. If the original path holds a *different* file (e.g. the camera
+    reused the filename after the shot was trashed), the restore is refused with
+    :class:`RestoreConflictError` — it never overwrites content it can't verify.
     """
     trash_path = Path(trash_path)
     original = Path(original_path)
@@ -155,9 +163,14 @@ def restore(trash_path: str | Path, original_path: str | Path) -> Path:
         raise FileNotFoundError(f"trash copy missing: {trash_path}")
 
     trash_hash = hash_file(trash_path)
-    if original.exists() and hash_file(original) == trash_hash:
-        trash_path.unlink(missing_ok=True)  # idempotent cleanup
-        return original
+    if original.exists():
+        if hash_file(original) == trash_hash:
+            trash_path.unlink(missing_ok=True)  # idempotent cleanup
+            return original
+        raise RestoreConflictError(
+            f"a different file now exists at {original} — refusing to overwrite "
+            "it (the trashed copy is kept in the trash)"
+        )
 
     original.parent.mkdir(parents=True, exist_ok=True)
     tmp = original.with_name(original.name + _TMP_SUFFIX)
@@ -172,7 +185,7 @@ def restore(trash_path: str | Path, original_path: str | Path) -> Path:
 
 # -- bulk recovery (rescue files stranded in the trash) --------------------
 def recover_all(
-    trash_dir: str | Path, card_root: str | Path
+    trash_dir: str | Path, card_root: str | Path, *, strict: bool = True
 ) -> tuple[int, list[tuple[str, str]]]:
     """Restore every eligible image under ``trash_dir`` to its mirrored path on
     the card — the inverse of :func:`stage_move`'s layout (it trashes to
@@ -184,8 +197,11 @@ def recover_all(
     tree, reconstructing each destination from the mirrored path so it is correct
     even if the card is now mounted somewhere else.
 
-    Only eligible ``DCIM/<folder>/`` image files are touched; anything else in the
-    trash dir is skipped.
+    ``strict`` mirrors :func:`~foto_util.safety.assert_deletable`'s card mode: on a
+    real card only ``DCIM/<folder>/`` image files are restored; for a plain
+    (non-card) folder source the DCIM-shape requirement is relaxed, since its
+    trash mirror has whatever layout the folder had. Image-only and
+    management-folder exclusions always apply; anything else is skipped.
 
     Conflict-safe: a trash file is restored only when its card slot is **empty**
     (the true orphan case) or already holds the **same bytes** (in which case the
@@ -208,7 +224,7 @@ def recover_all(
             continue
         if not (
             is_image_file(f)
-            and is_within_dcim(f, trash_dir)
+            and (not strict or is_within_dcim(f, trash_dir))
             and not touches_management_dir(f, trash_dir)
         ):
             continue  # stray non-image / wrong-shape file: leave it alone
@@ -228,14 +244,19 @@ def recover_all(
 
 # -- permanent removal (explicit, confirmed; guard G10) --------------------
 def empty_trash(trash_dir: str | Path) -> int:
-    """Permanently delete everything under ``trash_dir``. Returns file count.
+    """Permanently delete everything under ``trash_dir``. Returns the count of
+    staged files removed (leftover ``*.foto-util-tmp`` debris is deleted too but
+    not counted — it was never a recoverable file).
 
     This touches only the off-card trash; it never goes near a card.
     """
     trash_dir = Path(trash_dir)
     if not trash_dir.exists():
         return 0
-    count = sum(1 for f in trash_dir.rglob("*") if f.is_file())
+    count = sum(
+        1 for f in trash_dir.rglob("*")
+        if f.is_file() and not f.name.endswith(_TMP_SUFFIX)
+    )
     shutil.rmtree(trash_dir)
     return count
 
@@ -246,5 +267,6 @@ __all__ = [
     "recover_all",
     "empty_trash",
     "VerificationError",
+    "RestoreConflictError",
     "UnsafePathError",
 ]

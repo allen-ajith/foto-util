@@ -90,6 +90,24 @@ def test_trash_roundtrip_preserves_mtime_but_drops_xattrs(card, tmp_path):
         assert "user.footest" not in os.listxattr(src)     # xattrs NOT propagated
 
 
+def test_restore_refuses_to_overwrite_a_different_file(card, tmp_path):
+    """If the original path now holds *different* content (e.g. the camera
+    reused the filename after the shot was trashed), restore must refuse —
+    overwriting would destroy the newer file with no staging on the way back."""
+    trash = tmp_path / "trash"
+    src = _arw(card)
+    orig_hash = hash_file(src)
+    dest = fileops.stage_move(src, card, trash, strict=True)
+    src.write_bytes(b"A NEW, DIFFERENT PHOTO AT THE SAME PATH")
+    new_hash = hash_file(src)
+
+    with pytest.raises(fileops.RestoreConflictError):
+        fileops.restore(dest, src)
+
+    assert hash_file(src) == new_hash                      # new file untouched
+    assert dest.exists() and hash_file(dest) == orig_hash  # trash copy retained
+
+
 def test_restore_is_idempotent_when_original_present(card, tmp_path):
     trash = tmp_path / "trash"
     src = _arw(card)
@@ -168,6 +186,26 @@ def test_recover_all_cleans_up_when_card_already_has_same_bytes(card, tmp_path):
     assert restored == 1
     assert hash_file(a) == h                                   # card version intact
     assert not dest.exists()                                   # redundant copy cleaned up
+
+
+def test_recover_all_non_strict_restores_plain_folder_layout(tmp_path):
+    """A plain-folder source mirrors its own layout into the trash (no DCIM
+    shape); non-strict recover must put those files back rather than silently
+    skipping everything."""
+    trash = tmp_path / "trash"
+    root = tmp_path / "folder"
+    (root / "sub").mkdir(parents=True)
+    img = root / "sub" / "IMG_0001.JPG"
+    img.write_bytes(b"jpeg bytes")
+    h = hash_file(img)
+    dest = fileops.stage_move(img, root, trash, strict=False)
+    assert not img.exists()
+
+    restored, errors = fileops.recover_all(trash, root, strict=False)
+
+    assert errors == [] and restored == 1
+    assert img.exists() and hash_file(img) == h
+    assert not dest.exists()
 
 
 def test_empty_trash_only_touches_trash(card, tmp_path):
