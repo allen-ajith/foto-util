@@ -218,3 +218,25 @@ def test_empty_trash_only_touches_trash(card, tmp_path):
     assert not trash.exists()
     # the card still has everything we didn't move
     assert (card / "DCIM" / "100MSDCF" / "DSC00003.ARW").exists()
+
+
+def test_sidecar_sweep_is_pattern_locked_to_dcim(card):
+    """Eject's opt-in sidecar sweep may only remove ``._*`` files under DCIM/.
+    Photos, and ._ files elsewhere on the card, are untouchable."""
+    folder = card / "DCIM" / "100MSDCF"
+    in_dcim = folder / "._DSC00001.JPG"
+    in_dcim.write_bytes(b"\x00\x05\x16\x07")
+    outside = card / "PRIVATE" / "._SONYCARD"
+    outside.parent.mkdir(exist_ok=True)
+    outside.write_bytes(b"\x00\x05\x16\x07")
+    photo = folder / "DSC00001.JPG"
+
+    found = fileops.find_sidecars(card)
+    assert in_dcim in found and outside not in found
+
+    assert fileops.clean_sidecars(card) == len(found)
+    assert not in_dcim.exists()
+    assert outside.exists() and photo.exists()      # untouched
+
+    # a source with no DCIM/ (plain folder) has nothing to sweep
+    assert fileops.find_sidecars(card / "PRIVATE") == []

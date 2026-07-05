@@ -242,6 +242,32 @@ def recover_all(
     return restored, errors
 
 
+# -- macOS sidecar cleanup (opt-in, offered at eject) -----------------------
+def find_sidecars(card_root: str | Path) -> list[Path]:
+    """The macOS ``._`` AppleDouble sidecar files under the card's ``DCIM/``.
+
+    macOS materializes extended attributes as ``._<name>`` files on exFAT
+    cards; cameras never create or read them. Pattern-locked: only regular
+    files whose own name starts with ``._``, only under the DCIM tree — the
+    pattern cannot match a photo. A source with no ``DCIM/`` yields nothing.
+    """
+    dcim = Path(card_root) / "DCIM"
+    if not dcim.is_dir():
+        return []
+    return sorted(
+        p for p in dcim.rglob("._*") if p.is_file() and p.name.startswith("._")
+    )
+
+
+def clean_sidecars(card_root: str | Path) -> int:
+    """Remove the sidecars :func:`find_sidecars` reports. Returns the count."""
+    removed = 0
+    for p in find_sidecars(card_root):
+        p.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 # -- permanent removal (explicit, confirmed; guard G10) --------------------
 def empty_trash(trash_dir: str | Path) -> int:
     """Permanently delete everything under ``trash_dir``. Returns the count of
@@ -265,6 +291,8 @@ __all__ = [
     "stage_move",
     "restore",
     "recover_all",
+    "find_sidecars",
+    "clean_sidecars",
     "empty_trash",
     "VerificationError",
     "RestoreConflictError",
