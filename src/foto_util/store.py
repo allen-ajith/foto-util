@@ -32,12 +32,14 @@ CREATE TABLE IF NOT EXISTS shot(
 CREATE INDEX IF NOT EXISTS shot_volume ON shot(volume_id);
 CREATE INDEX IF NOT EXISTS shot_order ON shot(group_id, jpg_path, raw_path);
 
--- Per-file scan cache (performance only — never identity or decisions). Keyed by
--- the *card-relative* path so it survives a remount under a new mountpoint, and
--- the stable volume id. A rescan reuses the stored hash + capture time whenever
--- size+mtime are unchanged, so an unmodified card reads no file bytes at all and
--- a changed card reads only the new/modified files. Safe to drop entirely; it
--- just forces a one-time full re-hash to repopulate.
+-- Per-file scan cache. Keyed by the *card-relative* path so it survives a
+-- remount under a new mountpoint, and the stable volume id. A rescan reuses the
+-- stored hash + capture time whenever size+mtime are unchanged, so an unmodified
+-- card reads no file bytes at all and a changed card reads only the new/modified
+-- files. Note the caveat: a cache hit *supplies* the identity hash, so a file
+-- replaced in-place with identical size and mtime would keep its stale identity
+-- (the standard stat-cache trade-off; vanishingly unlikely for camera files).
+-- Safe to drop entirely; it just forces a one-time full re-hash to repopulate.
 CREATE TABLE IF NOT EXISTS file_cache(
   volume_id     TEXT NOT NULL,
   rel_path      TEXT NOT NULL,
@@ -223,17 +225,29 @@ class Store:
         self.conn.commit()
 
     def clear_trash_pointers(self, volume_id: str | None = None) -> int:
-        """Drop the ``trash_*`` pointers (keeping the decision) for shots whose
-        trash has been emptied. After Empty trash the staged files are gone, so
-        the decisions are now final — clearing the pointers stops undo from
-        offering to restore files that no longer exist."""
+        """Finalize the shots whose trash has just been emptied: drop the
+        ``trash_*`` pointers (keeping the decision), and null the matching
+        ``jpg_path`` / ``raw_path`` — the file a pointer referred to is now
+        permanently gone, so its on-card path is fiction. Keeping it would let
+        the row lie (e.g. a keep-JPEG shot re-decided to 'keep both' would claim
+        a RAW that no longer exists anywhere). A fully rejected row ends up
+        referencing nothing, which is exactly what lets pruning drop it from the
+        roll. Clearing the pointers also stops undo from offering to restore
+        files that no longer exist."""
         where = "(trash_jpg IS NOT NULL OR trash_raw IS NOT NULL)"
         args: tuple = ()
         if volume_id is not None:
             where += " AND volume_id=?"
             args = (volume_id,)
         cur = self.conn.execute(
-            f"UPDATE shot SET trash_jpg=NULL, trash_raw=NULL WHERE {where}", args
+            f"""
+            UPDATE shot SET
+                jpg_path = CASE WHEN trash_jpg IS NOT NULL THEN NULL ELSE jpg_path END,
+                raw_path = CASE WHEN trash_raw IS NOT NULL THEN NULL ELSE raw_path END,
+                trash_jpg = NULL, trash_raw = NULL
+            WHERE {where}
+            """,
+            args,
         )
         self.conn.commit()
         return cur.rowcount
@@ -334,8 +348,10 @@ class Store:
         return [_row_to_shot(r) for r in rows]
 
     def counts(self, volume_id: str | None = None) -> dict[str, int]:
-        where = "WHERE volume_id=?" if volume_id else ""
-        args = (volume_id,) if volume_id else ()
+        # ``is None`` (not truthiness), matching every other volume-scoped query:
+        # "" must scope to nothing rather than silently counting all volumes.
+        where = "WHERE volume_id=?" if volume_id is not None else ""
+        args = (volume_id,) if volume_id is not None else ()
         total = self.conn.execute(
             f"SELECT COUNT(*) FROM shot {where}", args
         ).fetchone()[0]
@@ -365,8 +381,11 @@ class Store:
         return cur.rowcount
 
     def clear_all(self) -> int:
-        """Reset the whole DB (the hard-confirm 'clear all' scope). Files only —
-        never any image file (this only empties the metadata table)."""
+        """Reset the whole DB (the hard-confirm 'clear all' scope): every shot
+        row *and* the scan cache, so the next scan re-reads and re-hashes every
+        file — a true cold reset. Never touches an image file. Returns the shot
+        row count removed."""
         cur = self.conn.execute("DELETE FROM shot")
+        self.conn.execute("DELETE FROM file_cache")
         self.conn.commit()
         return cur.rowcount

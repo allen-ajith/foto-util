@@ -79,16 +79,27 @@ def test_last_recoverable_and_pending_count(store):
     assert store.last_recoverable("v").hash == "rej"   # latest decided_at wins
 
 
-def test_clear_trash_pointers_keeps_decision(store):
+def test_clear_trash_pointers_finalizes_paths(store):
     """Empty trash: pointers drop (decision is now final) so undo stops offering
-    files that no longer exist."""
-    store.upsert_scanned(hash="h", volume_id="v", jpg_path="/a.jpg",
+    files that no longer exist — and the paths of the deleted files drop with
+    them, so a keep-JPEG row is truthfully JPEG-only afterwards instead of
+    claiming a RAW that is gone forever."""
+    store.upsert_scanned(hash="rej", volume_id="v", jpg_path="/a.jpg",
                          raw_path="/a.arw", group_id=0)
-    store.set_decision("h", Decision.REJECT, trash_jpg="/t/a.jpg", trash_raw="/t/a.arw")
-    assert store.clear_trash_pointers("v") == 1
-    shot = store.get("h")
-    assert shot.decision is Decision.REJECT
-    assert shot.trash_jpg is None and shot.trash_raw is None
+    store.set_decision("rej", Decision.REJECT, trash_jpg="/t/a.jpg", trash_raw="/t/a.arw")
+    store.upsert_scanned(hash="kept", volume_id="v", jpg_path="/b.jpg",
+                         raw_path="/b.arw", group_id=0)
+    store.set_decision("kept", Decision.KEEP_JPG, trash_raw="/t/b.arw")
+
+    assert store.clear_trash_pointers("v") == 2
+
+    rej = store.get("rej")
+    assert rej.decision is Decision.REJECT
+    assert rej.trash_jpg is None and rej.trash_raw is None
+    assert rej.jpg_path is None and rej.raw_path is None      # references nothing now
+    kept = store.get("kept")
+    assert kept.jpg_path == "/b.jpg"                          # still on the card
+    assert kept.raw_path is None                              # gone for good
     assert store.last_recoverable("v") is None
 
 
@@ -141,3 +152,21 @@ def test_delete_volume_and_clear_all(store):
     assert store.get("a") is None and store.get("b") is not None
     assert store.clear_all() == 1
     assert store.get("b") is None
+
+
+def test_clear_all_also_wipes_the_scan_cache(store):
+    """Clear all is the true cold reset: shot rows AND the file cache go, so the
+    next scan re-reads every file. Forget-this-card keeps the cache by design."""
+    store.upsert_scanned(hash="a", volume_id="v1", jpg_path="/a", raw_path=None, group_id=0)
+    store.upsert_file_cache(volume_id="v1", rel_path="DCIM/100/a.jpg",
+                            size=10, mtime=1.0, hash="a", capture_time=None)
+    store.upsert_file_cache(volume_id="v2", rel_path="DCIM/100/b.jpg",
+                            size=20, mtime=2.0, hash="b", capture_time=3.0)
+
+    # delete_volume (Forget this card) leaves the cache alone
+    store.delete_volume("v1")
+    assert store.cached_files("v1")  # still cached → instant rescan
+
+    store.clear_all()
+    assert store.cached_files("v1") == {}
+    assert store.cached_files("v2") == {}
