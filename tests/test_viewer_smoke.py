@@ -481,3 +481,94 @@ def test_menus_are_wired(card, store, qapp):
     # the verify-backups item is present and gated on exiftool the same way
     assert "Verify and clear clock-fix backups" in tools
     assert tools["Verify and clear clock-fix backups"].isEnabled() == meta.exiftool_available()
+
+
+def test_storage_dialog_lists_trash_and_gates_empty(card, store, qapp):
+    """The Storage dialog lists every per-card trash dir with its size, marks the
+    open card, and only enables Empty for it (and only when it has files)."""
+    from foto_util.model import Decision
+    from foto_util.viewer import StorageDialog
+
+    win, session = _make_window(card, store)
+
+    # trash empty → row-less listing, Empty disabled
+    dlg = StorageDialog(win)
+    assert not dlg.empty_btn.isEnabled()
+
+    # stage something into this card's trash, plus a fake other-card trash dir
+    _seek(session, "DSC00020.")
+    session.decide(Decision.REJECT, advance=False)
+    other = session.trash_dir.parent / "uuid_OTHER-CARD"
+    (other / "DCIM" / "100MSDCF").mkdir(parents=True)
+    (other / "DCIM" / "100MSDCF" / "DSC00001.JPG").write_bytes(b"x" * 100)
+
+    dlg = StorageDialog(win)
+    labels = [dlg.list.item(i).text() for i in range(dlg.list.count())]
+    assert any("the card open now" in t for t in labels)       # current card marked
+    assert any("uuid_OTHER-CARD" in t for t in labels)         # unmounted card visible
+    assert dlg.empty_btn.isEnabled()                           # current card has files
+    assert "Total:" in dlg.lbl_total.text()
+
+
+def test_blocking_progress_dialog_ignores_close_until_allowed(qapp):
+    """The clock-fix dialog must swallow Esc/close while work runs — dropping its
+    modal barrier would let culling race the exiftool rewrite."""
+    from foto_util.viewer import BlockingProgressDialog
+
+    dlg = BlockingProgressDialog("working…", "", 0, 10)
+    dlg.show()
+    dlg.reject()                     # Esc lands here → ignored
+    assert dlg.isVisible()
+    dlg.close()                      # window close button → ignored
+    assert dlg.isVisible()
+    dlg.allow_close()
+    dlg.close()                      # completion handler path
+    assert not dlg.isVisible()
+
+
+def test_rejected_shot_previews_from_its_trash_copy(card, store, qapp):
+    """Navigating back to a 3-deleted (red) shot must still show the photo —
+    rendered from its byte-verified trash copy — so deciding whether to
+    un-delete it is never done against a blank frame. Restoring must switch
+    the view back to the card file."""
+    win, session = _make_window(card, store)
+    _seek(session, "DSC00020.")
+    win._render()
+    assert win._shown_path == session.current.jpg_path   # normal: card file
+
+    win.handle_action("reject")
+    win._pending_timer.stop()
+    shot = store.get(session.current.hash)
+    assert shot.trash_jpg and not Path(shot.jpg_path).exists()
+
+    # navigate away and back — the red shot shows its trash copy, decoded
+    win.handle_action("skip")
+    win.handle_action("prev")
+    assert win._shown_path == shot.trash_jpg
+    assert win.image._base_pix is not None               # a real image, not blank
+
+    # un-delete: the view returns to the restored card file
+    win.handle_action("keep_both")
+    assert win._shown_path == session.current.jpg_path
+    assert win.image._base_pix is not None
+
+
+def test_restoring_redecide_announces_itself(card, store, qapp):
+    """Pressing 2 on a trashed (red) shot restores the files — and the status
+    flash must say so, so a revival is never mistaken for a phantom entry."""
+    win, session = _make_window(card, store)
+    _seek(session, "DSC00020.")
+    win.handle_action("reject")
+    win._pending_timer.stop()          # stay on the shot (no auto-advance)
+    win.handle_action("keep_both")
+    assert "Restored from trash" in win._toast.text()
+    assert "Kept RAW + JPEG" in win._toast.text()
+    # and the files really are back
+    assert (card / "DCIM" / "100MSDCF" / "DSC00020.JPG").exists()
+    assert (card / "DCIM" / "100MSDCF" / "DSC00020.ARW").exists()
+
+    # a plain first-time decision must NOT claim a restore
+    win._pending_timer.stop()
+    _seek(session, "DSC00001.")
+    win.handle_action("keep_both")
+    assert "Restored" not in win._toast.text()

@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import backups, fileops, hashing, indexer, meta, prune, volume
+from . import backups, fileops, indexer, meta, prune, volume
 from .appdir import db_path
 from .controller import Session
 from .grouping import SCENE_GAP_S
@@ -157,6 +157,7 @@ class ScanWorker(QThread):
 
     progressed = Signal(int, int)
     done = Signal(int)
+    failed = Signal(str)
 
     def __init__(self, scan_target: Path, volume_id: str | None, gap_s: float):
         super().__init__()
@@ -173,6 +174,12 @@ class ScanWorker(QThread):
                 progress=lambda d, t: self.progressed.emit(d, t),
                 should_stop=lambda: self._stop,
             )
+        except Exception as e:
+            # Surface the failure instead of dying silently — an uncaught error
+            # here would leave the UI stuck showing "scanning…" forever.
+            if not self._stop:
+                self.failed.emit(str(e))
+            return
         finally:
             store.close()
         if not self._stop:          # don't kick off follow-on work during shutdown
@@ -196,10 +203,13 @@ class BackupVerifyWorker(QThread):
         self._stop = False
 
     def run(self) -> None:  # pragma: no cover - exercised via the GUI
+        # The progress emission is gated on the stop flag too: after a cancel,
+        # the in-flight batch still finishes and reports — and a setValue() on a
+        # canceled QProgressDialog would *re-show* it as a frozen zombie.
         res = backups.verify_and_remove(
             self.root,
             batch=16,
-            progress=lambda d, t: self.progressed.emit(d, t),
+            progress=lambda d, t: None if self._stop else self.progressed.emit(d, t),
             should_stop=lambda: self._stop,
         )
         if not self._stop:   # don't deliver a result into a closing window
@@ -213,18 +223,24 @@ class ClockFixWorker(QThread):
     """Runs the clock-fix off the UI thread: shift dates (batched, with progress),
     re-key the rows so decisions survive the byte change, then clean the ``._``
     sidecars the shift created. One continuous progress bar covers the shift and
-    re-key phases. Interruptible at each batch."""
+    re-key phases.
+
+    Deliberately *not* interruptible: a clock-fix is all-or-nothing (stopping
+    between batches would leave the card half-corrected, and stopping mid-rekey
+    would orphan decisions whose files were already shifted). The window refuses
+    to close while this runs; a hung exiftool is bounded by meta's timeout."""
 
     progressed = Signal(int, int)
     result_ready = Signal(int, str)  # (files_shifted, error_message_or_empty)
 
-    def __init__(self, paths: list[str], offset: int, shots: list, card_root: Path):
+    def __init__(self, paths: list[str], offset: int, shots: list,
+                 card_root: Path, volume_id: str | None):
         super().__init__()
         self._paths = paths
         self._offset = offset
         self._shots = shots
         self._card_root = card_root
-        self._stop = False
+        self._volume_id = volume_id
 
     def run(self) -> None:  # pragma: no cover - exercised via the GUI
         store = Store(db_path())
@@ -234,34 +250,55 @@ class ClockFixWorker(QThread):
             n = meta.shift_all_dates(
                 self._paths, self._offset, batch=32,
                 progress=lambda d, t: self.progressed.emit(d, grand),
-                should_stop=lambda: self._stop,
             )
-            # re-key affected rows so decisions survive the byte change
-            for i, s in enumerate(self._shots, 1):
-                if self._stop:
-                    break
-                src = s.jpg_path or s.raw_path
-                if src and Path(src).exists():
-                    store.rekey(s.hash, hashing.hash_file(src))
-                self.progressed.emit(n_paths + i, grand)
-            meta.clean_appledouble(self._card_root)
+            # Re-key rows so decisions survive the byte change, refreshing the
+            # scan cache in the same pass — the next scan then reads no bytes.
+            indexer.rekey_shifted(
+                store, self._shots, self._volume_id, self._card_root,
+                self._offset,
+                progress=lambda d, t: self.progressed.emit(n_paths + d, grand),
+            )
+            # only the sidecars this shift created — never a card-wide sweep
+            meta.clean_appledouble(self._paths)
         except Exception as e:  # surface the failure; never crash the thread
             store.close()
-            if not self._stop:
-                self.result_ready.emit(0, str(e))
+            self.result_ready.emit(0, str(e))
             return
         store.close()
-        if not self._stop:
-            self.result_ready.emit(n, "")
+        self.result_ready.emit(n, "")
 
-    def stop(self) -> None:
-        self._stop = True
+
+class BlockingProgressDialog(QProgressDialog):
+    """A progress dialog that cannot be dismissed while its work runs.
+
+    Esc (which lands in ``reject``) and the window-close button are ignored
+    until :meth:`allow_close` is called by the completion handler. Used for the
+    clock-fix: it has no cancel path by design, and if the dialog could be
+    dismissed early its window-modal barrier would drop — letting the user cull
+    files while exiftool is still rewriting them underneath."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._closable = False
+
+    def allow_close(self) -> None:
+        self._closable = True
+
+    def reject(self) -> None:
+        if self._closable:
+            super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt name)
+        if self._closable:
+            super().closeEvent(event)
+        else:
+            event.ignore()
 
 
 class ImageView(QGraphicsView):
     """Fit-to-window image with a loupe that zooms toward the cursor.
 
-    ``Z`` toggles between fit-to-window and a 100% loupe centred on wherever the
+    ``4`` toggles between fit-to-window and a 100% loupe centred on wherever the
     pointer is (not the middle of the frame), so you zoom into the spot you're
     inspecting. The scroll wheel zooms in/out continuously, anchored under the
     cursor; drag to pan when zoomed."""
@@ -493,6 +530,9 @@ class MainWindow(QMainWindow):
         self._shown_path: str | None = None   # currently displayed image; skip redundant reloads
         self._resumed = False                 # resume-to-first-undecided happens once, on load
         self._freed_cache: int | None = None  # cached trash size; invalidated when the trash changes
+        # (path, parsed EXIF) for the shown shot — re-read only when the path
+        # changes, not on every render tick during a long background scan.
+        self._exif_cache: tuple[str, meta.DisplayExif] | None = None
         self.setWindowTitle("foto-util")
         self.resize(1100, 760)
         self.setStyleSheet(
@@ -628,6 +668,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Recover trashed files to card", self._do_recover_trash)
         file_menu.addAction("Empty trash (permanently delete)", self._do_empty_trash)
+        file_menu.addSeparator()
+        file_menu.addAction("Storage…", self._do_storage)
 
         db = bar.addMenu("Database")
         db.addAction("Prune stale rows", self._do_prune_stale)
@@ -651,8 +693,8 @@ class MainWindow(QMainWindow):
         """Switch the window to a new card/folder: rebuild the session over the
         same store and rescan, without restarting the app."""
         target = Path(target)
-        vol = volume.volume_id_for(target)
         root = volume.card_root_for(target)
+        vol = volume.source_id_for(root)
         strict = volume.is_card(root)
         self._stop_workers()  # halt any in-flight scan for the old source
         self.scan_target = target
@@ -660,6 +702,7 @@ class MainWindow(QMainWindow):
             self.session.store, card_root=root, volume_id=vol, strict=strict)
         self.strip.session = self.session
         self._shown_path = None      # force the first image of the new source to load
+        self._exif_cache = None
         self._resumed = False        # resume onto the new source's first undecided shot
         self._invalidate_freed()     # different volume → different trash dir
         self.setWindowTitle(f"foto-util — {root.name or target}")
@@ -671,15 +714,22 @@ class MainWindow(QMainWindow):
         if picked is not None:
             self.open_source(picked)
 
+    def _do_storage(self) -> None:  # pragma: no cover - dialog-bound
+        StorageDialog(self).exec()
+
     # -- scanning -----------------------------------------------------------
     def _stop_workers(self) -> None:
         """Cleanly stop and join the background threads (so a QThread is never
-        destroyed while running — that aborts the process)."""
+        destroyed while running — that aborts the process). The clock-fix worker
+        is deliberately never interrupted (all-or-nothing); it is only joined —
+        closeEvent refuses to close while it runs, and the modal progress dialog
+        blocks every other path here, so in practice it has already finished."""
         for attr in ("_worker", "_verify_worker", "_clock_worker"):
             w = getattr(self, attr)
             if w is not None:
-                w.stop()
-                w.wait(30000)   # a worker finishes its current batch before re-checking the flag
+                if hasattr(w, "stop"):
+                    w.stop()    # interruptible workers re-check the flag per batch
+                w.wait(600000)  # bounded by the per-batch exiftool timeout
                 setattr(self, attr, None)
 
     def _start_scan(self) -> None:
@@ -687,6 +737,7 @@ class MainWindow(QMainWindow):
         self._worker = ScanWorker(self.scan_target, self.session.volume_id, self.gap_s)
         self._worker.progressed.connect(self._on_progress)
         self._worker.done.connect(self._on_scan_done)
+        self._worker.failed.connect(self._on_scan_failed)
         self._worker.start()
 
     def _rescan_current_source(self) -> None:
@@ -710,6 +761,13 @@ class MainWindow(QMainWindow):
     def _on_scan_done(self, n: int) -> None:
         self.strip.clear_scanning()            # groups assigned now → per-group strip
         self.refresh()
+
+    def _on_scan_failed(self, err: str) -> None:
+        # Leave whatever rows were written (they're valid); just stop pretending
+        # a scan is still running and tell the user what happened.
+        self.strip.clear_scanning()
+        self.refresh()
+        self.show_status(f"scan failed: {err}", ACCENT_REJECT, ms=6000)
 
     # -- rendering ----------------------------------------------------------
     def refresh(self) -> None:
@@ -745,16 +803,29 @@ class MainWindow(QMainWindow):
             f"color: {bcolor}; background: rgba(255,255,255,0.06);"
             f" border: 1px solid {HAIRLINE}; border-radius: 8px;"
             " padding: 1px 8px; font-size: 11px; font-weight: 600;")
-        de = meta.read_display_exif(shot.jpg_path) if shot.jpg_path else meta.DisplayExif()
+        # A rejected shot's JPEG is off the card, but its byte-verified trash
+        # copy exists — display (and read EXIF) from that, so a red shot can be
+        # reviewed instead of un-deleted blind. trash_jpg is only ever set after
+        # the copy was verified, so this never guesses.
+        display_jpg = shot.trash_jpg or shot.jpg_path
+        # EXIF for the top bar, cached per path — the scan refreshes the view
+        # every few files for minutes, and re-parsing the same JPEG each tick
+        # is a wasted disk read.
+        if display_jpg:
+            if self._exif_cache is None or self._exif_cache[0] != display_jpg:
+                self._exif_cache = (display_jpg, meta.read_display_exif(display_jpg))
+            de = self._exif_cache[1]
+        else:
+            de = meta.DisplayExif()
         self.lbl_exif.setText(de.one_line())
         self.lbl_when.setText(de.when_str())
 
         # Only (re)decode when the image actually changes. The background scan
         # refreshes the view periodically for minutes; reloading the same JPEG
         # each time would reset the loupe zoom and burn a full-res decode.
-        if shot.jpg_path != self._shown_path:
-            self.image.show_path(shot.jpg_path)  # JPEG-only viewing (no RAW decode)
-            self._shown_path = shot.jpg_path
+        if display_jpg != self._shown_path:
+            self.image.show_path(display_jpg)  # JPEG-only viewing (no RAW decode)
+            self._shown_path = display_jpg
 
         total = len(self.session.shots)
         counts = self.session.store.counts(self.session.volume_id)
@@ -808,22 +879,24 @@ class MainWindow(QMainWindow):
         shot = self.session.current
         if shot is None:
             return
-        # If this shot was rejected, its JPEG is in the trash and the view is
-        # blank; re-deciding restores the file to the card at the *same* path, so
-        # force the next render to reload it (the path-equality guard can't see a
-        # trashed→restored content change).
-        was_trashed = bool(shot.trash_jpg)
+        # A trashed JPEG displays from its trash copy, so a re-decide that moves
+        # it (either direction) changes the display path and the render below
+        # reloads via the ordinary path-equality guard — no forcing needed.
+        restored_any = bool(shot.trash_jpg or shot.trash_raw)
         try:
             self.session.decide(decision, advance=False)  # pause before advancing
         except Exception as e:  # orphan / safety refusal — surface, never crash
             self.show_status(str(e), ACCENT_REJECT, ms=2200)
             return
-        if was_trashed:
-            self._shown_path = None
         self._invalidate_freed()                          # the trash changed
         self.flash(DECISION_COLOR[decision])
         self._render()                                    # badge now shows kept state
-        self.show_status(*_decision_status(self.session.current))
+        text, color = _decision_status(self.session.current)
+        # A re-decide that pulled files back out of the trash says so explicitly
+        # — a revived shot must never be mistaken for a phantom entry.
+        if restored_any and decision is not Decision.REJECT and text:
+            text = f"Restored from trash · {text}"
+        self.show_status(text, color, ms=1800 if restored_any else 1100)
         self._pending_timer.start(ADVANCE_MS)             # then auto-advance
 
     def _act_keep_both(self) -> None:
@@ -886,6 +959,13 @@ class MainWindow(QMainWindow):
         self._position_overlays()
 
     def _act_eject(self) -> None:  # pragma: no cover - interactive/confirm
+        # Only a card is ejectable. A plain folder source lives on some mounted
+        # volume too (often the boot disk) — ejecting that would be a nasty
+        # surprise, so refuse outright.
+        if not volume.is_card(self.session.card_root):
+            self.show_status("this source is a folder, not a card — nothing to eject",
+                             TEXT_DIM, ms=2200)
+            return
         if QMessageBox.question(
             self, "Eject card",
             "Unmount the card now? After deletions, re-insert it and run\n"
@@ -895,7 +975,18 @@ class MainWindow(QMainWindow):
         import subprocess
 
         mp = volume.mount_point(self.scan_target)
-        subprocess.run(["diskutil", "eject", str(mp)], check=False)
+        try:
+            proc = subprocess.run(
+                ["diskutil", "eject", str(mp)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.show_status(f"eject failed: {e}", ACCENT_REJECT, ms=4000)
+            return
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip() or "diskutil error"
+            self.show_status(f"eject failed: {detail}", ACCENT_REJECT, ms=4000)
+            return
         self.show_toast("Re-insert the card, then run Recover Image DB on the camera.")
 
     def _do_recover_trash(self) -> None:  # pragma: no cover - dialog-bound
@@ -933,7 +1024,11 @@ class MainWindow(QMainWindow):
         only thing that permanently frees dropped files. Until this runs they
         stay recoverable in the off-card trash."""
         t = self.session.trash_dir
-        n = sum(1 for p in t.rglob("*") if p.is_file()) if t.exists() else 0
+        n = (
+            sum(1 for p in t.rglob("*")
+                if p.is_file() and not p.name.endswith(".foto-util-tmp"))
+            if t.exists() else 0
+        )
         if n == 0:
             self.show_status("trash is already empty", TEXT_DIM)
             return
@@ -948,8 +1043,12 @@ class MainWindow(QMainWindow):
             return
         removed = fileops.empty_trash(t)
         # The staged files are gone, so those decisions are now final: drop the
-        # trash pointers so undo stops offering to restore deleted files.
+        # trash pointers (and the now-fictional paths) so undo stops offering to
+        # restore deleted files — then prune the rows left referencing nothing,
+        # so fully deleted shots disappear from the roll instead of lingering as
+        # blank tombstones.
         self._store().clear_trash_pointers(self._vol())
+        prune.prune_stale(self._store(), self._vol())
         self._invalidate_freed()
         self.refresh()
         self.show_status(f"permanently deleted {removed} file(s)", ACCENT_REJECT)
@@ -1014,7 +1113,8 @@ class MainWindow(QMainWindow):
         if QMessageBox.warning(
             self, "Clear all",
             "Reset the ENTIRE database (every card)? This cannot be undone.\n"
-            "No image file is touched.",
+            "No image file is touched. The scan cache is cleared too, so the\n"
+            "next scan of each card re-reads every file (slower, one time).",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
@@ -1063,10 +1163,12 @@ class MainWindow(QMainWindow):
             return
         # Run the shift + re-key + ._ cleanup off the UI thread behind a modal
         # progress bar — a real card is thousands of files, so this must never
-        # freeze the window. Non-cancelable: a clock-fix is all-or-nothing (a
-        # partial shift would leave the card half-corrected).
+        # freeze the window. Non-cancelable, and the window refuses to close
+        # while it runs: a clock-fix is all-or-nothing (a partial shift would
+        # leave the card half-corrected, and an interrupted re-key would orphan
+        # decisions whose files were already shifted).
         grand = len(paths) + len(shots)
-        dlg = QProgressDialog("Fixing clock on the card…", "", 0, grand, self)
+        dlg = BlockingProgressDialog("Fixing clock on the card…", "", 0, grand, self)
         dlg.setWindowTitle("Fix clock offset")
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
         dlg.setCancelButton(None)
@@ -1074,15 +1176,18 @@ class MainWindow(QMainWindow):
         dlg.setAutoReset(False)
         dlg.setMinimumDuration(0)
         dlg.setValue(0)
-        worker = ClockFixWorker(paths, offset, shots, self.session.card_root)
+        worker = ClockFixWorker(paths, offset, shots, self.session.card_root,
+                                self.session.volume_id)
         self._clock_worker = worker
         worker.progressed.connect(lambda d, t: (dlg.setMaximum(t), dlg.setValue(d)))
         worker.result_ready.connect(lambda n, err: self._on_clockfix_done(n, err, dlg))
         worker.start()
 
     def _on_clockfix_done(self, n: int, err: str, dlg) -> None:  # pragma: no cover - dialog-bound
-        dlg.reset()
+        dlg.allow_close()
+        dlg.close()               # close, not reset() — reset leaves an emptied bar lingering
         self._clock_worker = None
+        self._exif_cache = None   # dates changed in place; re-read the top bar
         self.refresh()
         if err:
             self.show_toast(f"clock fix failed: {err}")
@@ -1108,6 +1213,14 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.StandardButton.Yes:
             return
 
+        # A previous (canceled) verify may still be finishing its in-flight
+        # batch — join it before replacing the reference, or the dropped QThread
+        # could be destroyed while running (which aborts the process).
+        if self._verify_worker is not None:
+            self._verify_worker.stop()
+            self._verify_worker.wait(600000)
+            self._verify_worker = None
+
         dlg = QProgressDialog("Verifying backups…", "Stop", 0, len(found), self)
         dlg.setWindowTitle("Verify and clear backups")
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
@@ -1118,11 +1231,20 @@ class MainWindow(QMainWindow):
         self._verify_worker = worker
         worker.progressed.connect(lambda d, t: (dlg.setMaximum(t), dlg.setValue(d)))
         worker.result_ready.connect(lambda res: self._on_verify_done(res, dlg))
-        dlg.canceled.connect(worker.stop)
+        dlg.canceled.connect(lambda: self._on_verify_canceled(worker))
         worker.start()
 
+    def _on_verify_canceled(self, worker) -> None:  # pragma: no cover - dialog-bound
+        """Stop (between batches) and tell the user where they stand — the
+        operation is resumable: already-cleared backups stay cleared, the rest
+        are picked up by simply running it again."""
+        worker.stop()
+        self.show_status(
+            "verify stopped — backups already cleared stay cleared; "
+            "run it again to continue", TEXT_DIM, ms=4000)
+
     def _on_verify_done(self, res, dlg) -> None:  # pragma: no cover - dialog-bound
-        dlg.reset()
+        dlg.close()
         self._verify_worker = None
         msg = f"Cleared {res.reclaimed} verified backup(s)."
         if res.mismatched:
@@ -1212,6 +1334,13 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # Never interrupt a running clock-fix: stopping mid-way would leave the
+        # card half-shifted with decisions orphaned. Finish first, then close.
+        if self._clock_worker is not None and self._clock_worker.isRunning():
+            self.show_status("clock fix in progress — wait for it to finish",
+                             ACCENT_JPG, ms=3000)
+            event.ignore()
+            return
         self._stop_workers()  # join the scan thread before teardown (avoids SIGABRT)
         super().closeEvent(event)
 
@@ -1324,10 +1453,120 @@ def pick_source(parent=None) -> Path | None:
     return None
 
 
+class StorageDialog(QDialog):
+    """File → Storage: how much disk the off-card trash takes, per card.
+
+    Lists every per-card trash folder under the app dir — including cards that
+    aren't mounted, whose space is otherwise invisible. Emptying is only offered
+    for the *currently open* card, through the exact same guarded path as
+    File → Empty trash, so a card's staged files can never be discarded behind
+    its back; for any other card, open it first.
+    """
+
+    def __init__(self, win: "MainWindow") -> None:
+        super().__init__(win)
+        self._win = win
+        self.setWindowTitle("Storage")
+        self.resize(560, 400)
+        self.setStyleSheet(
+            f"QDialog {{ background: {BG}; }}"
+            f"QLabel {{ color: {TEXT}; }}"
+            f"QListWidget {{ background: {SURFACE}; color: {TEXT};"
+            f"  border: 1px solid {HAIRLINE}; border-radius: 8px; padding: 4px;"
+            f"  font-size: 13px; outline: none; }}"
+            f"QListWidget::item {{ padding: 9px 10px; border-radius: 6px; }}"
+            f"QListWidget::item:selected {{ background: {SURFACE_HI}; }}"
+            f"QPushButton {{ background: {SURFACE_HI}; color: {TEXT};"
+            f"  border: 1px solid {HAIRLINE}; border-radius: 7px;"
+            f"  padding: 7px 16px; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: {SURFACE}; }}"
+            f"QPushButton:disabled {{ color: {TEXT_FAINT}; }}"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(12)
+        heading = QLabel("Off-card trash usage")
+        heading.setStyleSheet(f"color: {TEXT}; font-size: 16px; font-weight: 600;")
+        lay.addWidget(heading)
+        sub = QLabel(
+            "Staged deletions live here until the trash is emptied. To reclaim "
+            "another card's space, open that card first (File → Open).")
+        sub.setWordWrap(True)
+        sub.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
+        lay.addWidget(sub)
+
+        self.list = QListWidget()
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lay.addWidget(self.list, 1)
+
+        self.lbl_total = QLabel("")
+        self.lbl_total.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
+        lay.addWidget(self.lbl_total)
+
+        buttons = QHBoxLayout()
+        reveal = QPushButton("Reveal in Finder")
+        reveal.clicked.connect(self._reveal)
+        self.empty_btn = QPushButton("Empty this card's trash…")
+        self.empty_btn.clicked.connect(self._empty_current)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        close.setDefault(True)
+        buttons.addWidget(reveal)
+        buttons.addStretch(1)
+        buttons.addWidget(self.empty_btn)
+        buttons.addWidget(close)
+        lay.addLayout(buttons)
+
+        self._populate()
+
+    def _populate(self) -> None:
+        from .appdir import trash_root
+
+        self.list.clear()
+        root = trash_root()
+        current = self._win.session.trash_dir
+        total = 0
+        current_size = 0
+        dirs = sorted(d for d in root.iterdir() if d.is_dir()) if root.exists() else []
+        for d in dirs:
+            files = [p for p in d.rglob("*") if p.is_file()]
+            size = sum(p.stat().st_size for p in files)
+            total += size
+            is_current = d == current
+            if is_current:
+                current_size = size
+            mark = "   ← the card open now" if is_current else ""
+            item = QListWidgetItem(
+                f"{d.name}{mark}\n{len(files)} file(s) · {_human_size(size)}")
+            item.setData(Qt.ItemDataRole.UserRole, str(d))
+            if not is_current:
+                item.setForeground(QColor(TEXT_DIM))
+            self.list.addItem(item)
+        if not dirs:
+            item = QListWidgetItem("Trash is empty — nothing to reclaim.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QColor(TEXT_DIM))
+            self.list.addItem(item)
+        self.lbl_total.setText(f"Total: {_human_size(total)}")
+        self.empty_btn.setEnabled(current_size > 0)
+
+    def _reveal(self) -> None:  # pragma: no cover - opens Finder
+        from .appdir import trash_root
+        import subprocess
+
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(trash_root())], check=False)
+
+    def _empty_current(self) -> None:  # pragma: no cover - dialog-bound
+        self._win._do_empty_trash()   # same confirm + pointer cleanup as the menu
+        self._populate()
+
+
 def _session_for(target: Path) -> tuple[Session, Path]:
-    """Build a Session for ``target`` (resolving the card root / volume id)."""
-    vol = volume.volume_id_for(target)
+    """Build a Session for ``target`` (resolving the card root / source id)."""
     root = volume.card_root_for(target)
+    vol = volume.source_id_for(root)
     strict = volume.is_card(root)
     store = Store(db_path())
     return Session(store, card_root=root, volume_id=vol, strict=strict), target
