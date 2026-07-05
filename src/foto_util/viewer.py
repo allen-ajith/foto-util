@@ -977,7 +977,8 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "Eject card",
             "Eject the card now?\n\n"
-            "Tip: run Recover Image DB on the camera afterwards (Menu → Setup).",
+            "Tip: afterwards, run Recover Image DB in the camera's own menu, "
+            "under Setup.",
         ) != QMessageBox.StandardButton.Yes:
             return
         # Offer to hand the card back pristine: macOS materializes xattrs as
