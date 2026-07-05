@@ -972,6 +972,19 @@ class MainWindow(QMainWindow):
             "Menu → Setup → Recover Image DB on the camera.",
         ) != QMessageBox.StandardButton.Yes:
             return
+        # Offer to hand the card back pristine: macOS materializes xattrs as
+        # ``._`` sidecar files on exFAT, which the camera never reads. Opt-in
+        # every confirmed eject; pattern-locked to ._ files under DCIM
+        # (fileops.find_sidecars) so it can never match a photo. Declining
+        # still ejects.
+        n_side = len(fileops.find_sidecars(self.session.card_root))
+        if n_side and QMessageBox.question(
+            self, "Eject card",
+            f"Also remove {n_side} macOS “._” sidecar file(s) from the card?\n"
+            "That's metadata litter macOS writes to exFAT cards — the camera "
+            "never creates or reads it.",
+        ) == QMessageBox.StandardButton.Yes:
+            fileops.clean_sidecars(self.session.card_root)
         import subprocess
 
         mp = volume.mount_point(self.scan_target)
