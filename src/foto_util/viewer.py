@@ -675,6 +675,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Empty trash (permanently delete)", self._do_empty_trash)
         file_menu.addSeparator()
         file_menu.addAction("Storage…", self._do_storage)
+        file_menu.addSeparator()
+        eject = file_menu.addAction("Eject card", self._act_eject)
+        eject.setShortcut("Ctrl+E")   # shown as ⌘E on macOS; same handler as the key
 
         db = bar.addMenu("Database")
         db.addAction("Prune stale rows", self._do_prune_stale)
@@ -974,8 +977,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "Eject card",
             "Eject the card now?\n\n"
-            "Tip: if you deleted photos, put the card back in the camera and\n"
-            "run Menu → Setup → Recover Image DB so it rebuilds its index.",
+            "Tip: run Recover Image DB on the camera afterwards (Menu → Setup).",
         ) != QMessageBox.StandardButton.Yes:
             return
         # Offer to hand the card back pristine: macOS materializes xattrs as
@@ -1141,9 +1143,8 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.warning(
             self, "Clear all",
-            "Reset the entire database, for every card? This cannot be undone.\n"
-            "No photo is touched. The scan cache goes too, so the next scan\n"
-            "of each card re-reads every file once. That first scan is slower.",
+            "Reset the entire database, for every card?\n"
+            "No photo is touched, but every decision is gone for good.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
