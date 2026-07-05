@@ -22,6 +22,55 @@ def _count_reads(monkeypatch) -> dict:
     return counts
 
 
+def test_rekey_shifted_updates_rows_and_cache(card, store, monkeypatch):
+    """After an in-place edit (the clock-fix), rekey_shifted must move the row to
+    the new content hash AND refresh the scan cache — new stat + hash, capture
+    time shifted arithmetically — so the next scan reads zero bytes."""
+    vol = volume.volume_id_for(card)
+    indexer.scan(card / "DCIM", store, vol)
+    shots = store.shots(vol)
+    jpg = card / "DCIM" / "100MSDCF" / "DSC00001.JPG"
+    target = next(s for s in shots if s.jpg_path and s.jpg_path.endswith("DSC00001.JPG"))
+    old_hash = target.hash
+    rel = str(jpg.resolve().relative_to(card.resolve()))
+    old_ct = store.cached_files(vol)[rel][3]
+    assert old_ct is not None                       # fixture JPEGs carry EXIF time
+
+    # simulate the metadata edit: bytes change in place → identity hash changes
+    jpg.write_bytes(jpg.read_bytes() + b"\x00")
+    offset = 3600
+
+    n = indexer.rekey_shifted(store, shots, vol, card, offset)
+
+    assert n == 1                                   # only the edited file re-keyed
+    assert store.get(old_hash) is None
+    new_hash = hashing.hash_file(jpg)
+    assert store.get(new_hash) is not None
+    st = jpg.stat()
+    size, mtime, cached_hash, ct = store.cached_files(vol)[rel]
+    assert (size, mtime, cached_hash) == (st.st_size, st.st_mtime, new_hash)
+    assert ct == old_ct + offset                    # shifted arithmetically, no re-parse
+
+    # the payoff: a rescan after the fix reads no file contents at all
+    reads = _count_reads(monkeypatch)
+    indexer.scan(card / "DCIM", store, vol)
+    assert reads["n"] == 0
+
+
+def test_scan_through_a_symlinked_path(card, store, tmp_path):
+    """macOS paths like /tmp resolve elsewhere (/private/tmp); scanning through
+    a symlink must not crash the relative-key math (enumeration and the cache
+    anchor must agree on the resolved root)."""
+    link = tmp_path / "card-link"
+    link.symlink_to(card)
+    vol = volume.volume_id_for(card)
+
+    n = indexer.scan(link / "DCIM", store, vol)
+
+    assert n == 7
+    assert store.counts(vol)["total"] == 7
+
+
 def test_rescan_unchanged_reads_no_bytes(card, store, monkeypatch):
     """The whole point of the cache: a second scan of an unchanged card reads
     zero file contents and yields an identical index."""

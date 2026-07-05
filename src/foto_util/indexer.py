@@ -52,6 +52,10 @@ def scan(
     contents and a changed card reads only the new/modified files. The hash stays
     the ground-truth identity; the cache only decides whether we can skip reading.
     """
+    # Resolve the target first: card_root_for resolves symlinks, so enumerating
+    # the *unresolved* path (e.g. macOS's /tmp → /private/tmp) would yield files
+    # that are "not relative to" the anchor and crash the relative-key math.
+    root = Path(root).resolve()
     anchor = volume.card_root_for(root)       # stable base for the relative key
     paired = pairing.pair_folder(root)
     total = len(paired)
@@ -120,3 +124,55 @@ def scan(
     if volume_id is not None and not stopped:
         store.prune_file_cache(volume_id, seen_rel)
     return len(items)
+
+
+def rekey_shifted(
+    store: Store,
+    shots: list,
+    volume_id: str | None,
+    card_root: str | Path,
+    offset_seconds: int,
+    *,
+    progress: ProgressFn | None = None,
+) -> int:
+    """After an in-place metadata edit (the clock-fix), move each shot's row to
+    its file's new content hash — so decisions survive the byte change — and
+    refresh the scan cache in the same pass.
+
+    The cache refresh is what makes the post-fix rescan free: the new size,
+    mtime, and hash are recorded here (the file had to be read to re-hash it
+    anyway), and the cached capture time is shifted *arithmetically* by the same
+    offset the files were — no EXIF re-parse, no second read. Without this, the
+    next scan would re-read every shifted file from the card a second time.
+
+    Returns the number of rows re-keyed.
+    """
+    anchor = Path(card_root).resolve()
+    cache = store.cached_files(volume_id) if volume_id is not None else {}
+    rekeyed = 0
+    total = len(shots)
+    for i, s in enumerate(shots, 1):
+        src = s.jpg_path or s.raw_path          # the identity source (JPEG first)
+        p = Path(src) if src else None
+        if p is not None and p.exists():
+            new_hash = hashing.hash_file(p)
+            if store.rekey(s.hash, new_hash):
+                rekeyed += 1
+            if volume_id is not None:
+                try:
+                    rel = str(p.resolve().relative_to(anchor))
+                    st = p.stat()
+                except (OSError, ValueError):
+                    pass                        # outside the anchor / vanished: no cache row
+                else:
+                    old = cache.get(rel)
+                    old_ct = old[3] if old is not None else None
+                    store.upsert_file_cache(
+                        volume_id=volume_id, rel_path=rel,
+                        size=st.st_size, mtime=st.st_mtime, hash=new_hash,
+                        capture_time=(old_ct + offset_seconds)
+                        if old_ct is not None else None,
+                    )
+        if progress is not None:
+            progress(i, total)
+    return rekeyed
