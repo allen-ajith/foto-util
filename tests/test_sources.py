@@ -30,6 +30,21 @@ def test_list_sources_empty(monkeypatch):
     assert volume.list_sources() == []
 
 
+def test_source_id_distinguishes_folders_but_not_cards(card, tmp_path):
+    """Two plain folders on the same disk must never share a source id (their
+    rows and trash would pool, and 'Forget this card' on one would delete the
+    other's state). A card keeps its volume-level id."""
+    a, b = tmp_path / "folder_a", tmp_path / "folder_b"
+    a.mkdir()
+    b.mkdir()
+    ida, idb = volume.source_id_for(a), volume.source_id_for(b)
+    assert ida != idb
+    assert ida.startswith("path:") and idb.startswith("path:")
+    assert volume.source_id_for(a) == ida                 # stable across calls
+    # a card (has DCIM) identifies by its volume, as before
+    assert volume.source_id_for(card) == volume.volume_id_for(card)
+
+
 @pytest.fixture(scope="session")
 def qapp():
     from PySide6.QtWidgets import QApplication

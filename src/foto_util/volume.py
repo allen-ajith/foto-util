@@ -13,6 +13,7 @@ Nothing here writes to the card (guard G7).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import re
@@ -138,6 +139,23 @@ def volume_id_for(path: str | Path) -> str:
     except OSError:
         dev = 0
     return f"dev:{dev}:{mp.name or 'root'}"
+
+
+def source_id_for(root: str | Path) -> str:
+    """A stable id for a cull *source*.
+
+    A card (a root with ``DCIM``) is identified by its volume, via
+    :func:`volume_id_for` — stable across remounts. A plain folder is identified
+    by its own resolved path: folders must never share the volume's id, or two
+    folders on the same disk would pool their rows (and "Forget this card" on
+    one would delete the other's state). The path digest keeps the id unique
+    even after :func:`trash_dirname` sanitises it.
+    """
+    root = Path(root).resolve()
+    if is_card(root):
+        return volume_id_for(root)
+    digest = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
+    return f"path:{digest}:{root.name or 'root'}"
 
 
 def trash_dirname(volume_id: str) -> str:

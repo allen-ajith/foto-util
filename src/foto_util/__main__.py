@@ -53,8 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         if not target.exists():
             print(f"error: {target} does not exist", file=sys.stderr)
             return 2
-        vol = volume.volume_id_for(target)
         root = volume.card_root_for(target)
+        vol = volume.source_id_for(root)
         strict = volume.is_card(root)
         store = Store(db_path())
         n = indexer.scan(target, store, vol, gap_s=args.scene_gap,
