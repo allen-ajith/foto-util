@@ -19,6 +19,17 @@ def test_pairs_match_fixture_spec(card):
         assert ps.is_orphan is (spec.kind != "pair")
 
 
+def test_pairing_skips_hidden_directories(card):
+    """Finder-deleted photos live in the card's hidden ``.Trashes`` — files under
+    any dot-directory must not reappear as phantom shots to cull."""
+    hidden = card / ".Trashes" / "501"
+    hidden.mkdir(parents=True)
+    (hidden / "DSC09999.JPG").write_bytes(b"finder-deleted photo")
+
+    shots = pairing.pair_folder(card)
+    assert not any(s.stem == "DSC09999" for s in shots)
+
+
 def test_pairing_skips_appledouble_and_dotfiles(card):
     """macOS ``._*`` AppleDouble sidecars (and other dotfiles) carry an image
     extension but are metadata, not photos — they must never pair into shots."""

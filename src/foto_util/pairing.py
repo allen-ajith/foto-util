@@ -49,14 +49,18 @@ def pair_folder(root: str | Path) -> list[PairedShot]:
     pairs: dict[tuple[Path, str], PairedShot] = {}
 
     for path in sorted(root.rglob("*")):
-        # Skip dotfiles — notably macOS ``._*`` AppleDouble sidecars, which carry
-        # an image extension (``._DSC0001.JPG``) but are metadata, not photos, and
-        # would otherwise pair into phantom shots. Also skips ``.DS_Store`` etc.
-        if path.name.startswith(".") or not path.is_file() or not is_image(path):
+        if not path.is_file() or not is_image(path):
+            continue
+        rel_parts = path.relative_to(root).parts
+        # Skip anything hidden — dot *files* (macOS ``._*`` AppleDouble sidecars
+        # carry an image extension but are metadata, not photos) and anything
+        # inside a dot *directory* (``.Trashes`` on a card holds Finder-deleted
+        # photos, which must not reappear as phantom shots to cull).
+        if any(p.startswith(".") for p in rel_parts):
             continue
         # Skip the camera's management folders (video clips + thumbnails carry
         # image extensions like ``C0001T01.JPG`` but are not photos to cull).
-        if any(p.upper() in MANAGEMENT_DIRS for p in path.relative_to(root).parts[:-1]):
+        if any(p.upper() in MANAGEMENT_DIRS for p in rel_parts[:-1]):
             continue
         ext = _ext(path)
         key = (path.parent, path.stem.lower())
