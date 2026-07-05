@@ -72,7 +72,7 @@ HELP_ROWS = [
     ("1", "keep JPEG (drop RAW)"),
     ("2", "keep both"),
     ("3", "delete (drop both)"),
-    ("4", "zoom — wheel zoom, drag to pan"),
+    ("4", "zoom (wheel zooms, drag pans)"),
     ("R", "rotate 90°"),
     ("F", "fullscreen on / off"),
     ("← / →", "previous / next"),
@@ -147,6 +147,11 @@ def _human_size(n: int) -> str:
             return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
         f /= 1024
     return f"{f:.1f} TB"
+
+
+def _n(count: int, noun: str, plural: str | None = None) -> str:
+    """Counted noun for UI text: '1 file' / '3 files', never 'file(s)'."""
+    return f"{count} {noun if count == 1 else (plural or noun + 's')}"
 
 
 class ScanWorker(QThread):
@@ -705,7 +710,7 @@ class MainWindow(QMainWindow):
         self._exif_cache = None
         self._resumed = False        # resume onto the new source's first undecided shot
         self._invalidate_freed()     # different volume → different trash dir
-        self.setWindowTitle(f"foto-util — {root.name or target}")
+        self.setWindowTitle(f"foto-util · {root.name or target}")
         self.refresh()
         self._start_scan()
 
@@ -963,13 +968,14 @@ class MainWindow(QMainWindow):
         # volume too (often the boot disk) — ejecting that would be a nasty
         # surprise, so refuse outright.
         if not volume.is_card(self.session.card_root):
-            self.show_status("this source is a folder, not a card — nothing to eject",
-                             TEXT_DIM, ms=2200)
+            self.show_status("this source is a folder, not a card, so there is "
+                             "nothing to eject", TEXT_DIM, ms=2200)
             return
         if QMessageBox.question(
             self, "Eject card",
-            "Unmount the card now? After deletions, re-insert it and run\n"
-            "Menu → Setup → Recover Image DB on the camera.",
+            "Eject the card now?\n\n"
+            "Tip: if you deleted photos, put the card back in the camera and\n"
+            "run Menu → Setup → Recover Image DB so it rebuilds its index.",
         ) != QMessageBox.StandardButton.Yes:
             return
         # Offer to hand the card back pristine: macOS materializes xattrs as
@@ -980,9 +986,9 @@ class MainWindow(QMainWindow):
         n_side = len(fileops.find_sidecars(self.session.card_root))
         if n_side and QMessageBox.question(
             self, "Eject card",
-            f"Also remove {n_side} macOS “._” sidecar file(s) from the card?\n"
-            "That's metadata litter macOS writes to exFAT cards — the camera "
-            "never creates or reads it.",
+            f"While we're at it, remove {_n(n_side, 'macOS “._” sidecar file')} "
+            "from the card?\n\nmacOS leaves these behind on exFAT cards. Your "
+            "camera never creates or reads them, so they are safe to remove.",
         ) == QMessageBox.StandardButton.Yes:
             fileops.clean_sidecars(self.session.card_root)
         import subprocess
@@ -994,13 +1000,20 @@ class MainWindow(QMainWindow):
                 capture_output=True, text=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            self.show_status(f"eject failed: {e}", ACCENT_REJECT, ms=4000)
+            self.show_status(f"couldn't eject the card: {e}", ACCENT_REJECT, ms=4000)
             return
         if proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip() or "diskutil error"
-            self.show_status(f"eject failed: {detail}", ACCENT_REJECT, ms=4000)
+            self.show_status(f"couldn't eject the card: {detail}", ACCENT_REJECT, ms=4000)
             return
-        self.show_toast("Re-insert the card, then run Recover Image DB on the camera.")
+        # The card is gone, so the roll on screen points at nothing. Offer a
+        # new source; if the user is done, close the window rather than leave
+        # a dead view behind.
+        picked = pick_source(self)
+        if picked is not None:
+            self.open_source(picked)
+        else:
+            self.close()
 
     def _do_recover_trash(self) -> None:  # pragma: no cover - dialog-bound
         """Put every file in this card's trash back on the card. The rescue for
@@ -1017,8 +1030,8 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
             self, "Recover trashed files",
-            f"Restore {n} file(s) from this card's trash back onto the card?\n"
-            "Recovered shots become undecided again.",
+            f"Put {_n(n, 'file')} from this card's trash back on the card?\n"
+            "The shots involved become undecided again.",
         ) != QMessageBox.StandardButton.Yes:
             return
         restored, errors = self.session.recover_orphaned_trash()
@@ -1026,11 +1039,12 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.warning(
                 self, "Recover trashed files",
-                f"Restored {restored} file(s); {len(errors)} could not be restored:\n"
+                f"Put back {_n(restored, 'file')}, but {_n(len(errors), 'file')} "
+                "couldn't be restored:\n"
                 + "\n".join(f"• {Path(p).name}: {e}" for p, e in errors[:10]),
             )
         else:
-            self.show_status(f"recovered {restored} file(s) to the card", ACCENT_KEEP)
+            self.show_status(f"put {_n(restored, 'file')} back on the card", ACCENT_KEEP)
 
     def _do_empty_trash(self) -> None:  # pragma: no cover - dialog-bound
         """The explicit 'clear the deleted stuff' commit boundary (G10): the
@@ -1048,8 +1062,8 @@ class MainWindow(QMainWindow):
         size = _human_size(self._freed_bytes())
         if QMessageBox.warning(
             self, "Empty trash",
-            f"Permanently delete {n} dropped file(s) ({size}) for this card?\n"
-            "This cannot be undone — those shots will no longer be recoverable.",
+            f"Permanently delete {_n(n, 'dropped file')} ({size}) for this card?\n"
+            "There is no way back after this. Those shots will be gone for good.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
@@ -1064,7 +1078,7 @@ class MainWindow(QMainWindow):
         prune.prune_stale(self._store(), self._vol())
         self._invalidate_freed()
         self.refresh()
-        self.show_status(f"permanently deleted {removed} file(s)", ACCENT_REJECT)
+        self.show_status(f"deleted {_n(removed, 'file')} for good", ACCENT_REJECT)
 
     # -- database / clock-fix menu handlers ---------------------------------
     def _store(self) -> Store:
@@ -1081,14 +1095,14 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
             self, "Prune stale rows",
-            f"Delete {len(stale)} stale DB row(s) for this card?\n"
-            "They reference files gone from both the card and the trash. "
-            "No image file is touched.",
+            f"Forget {_n(len(stale), 'stale entry', 'stale entries')} for this "
+            "card?\nTheir files are gone from both the card and the trash. "
+            "No photo is touched.",
         ) != QMessageBox.StandardButton.Yes:
             return
         n = self._store().delete_rows([s.hash for s in stale])
         self.refresh()
-        self.show_toast(f"pruned {n} stale row(s)")
+        self.show_toast(f"forgot {_n(n, 'stale entry', 'stale entries')}")
 
     def _guard_pending_trash(self, title: str, volume_id: str | None) -> bool:
         """Refuse a metadata clear that would strand files still in the trash
@@ -1098,10 +1112,11 @@ class MainWindow(QMainWindow):
         if n:
             QMessageBox.warning(
                 self, title,
-                f"{n} shot(s) still have files in the trash. Clearing the database "
-                "would strand them (no in-app way to restore).\n\n"
-                "First use File → Recover trashed files to put them back, or "
-                "File → Empty trash to discard them for good.",
+                f"There are still trashed files for {_n(n, 'shot')}. Clearing "
+                "the database now would strand them with no way to restore "
+                "from inside the app.\n\n"
+                "Put them back first with File → Recover trashed files, or "
+                "delete them for good with File → Empty trash.",
             )
             return True
         return False
@@ -1112,29 +1127,30 @@ class MainWindow(QMainWindow):
         c = self._store().counts(self._vol())
         if QMessageBox.question(
             self, "Forget this card",
-            f"Remove all {c['total']} DB row(s) for this card and re-scan it from "
-            "scratch?\nNo image file is touched — every shot comes back undecided.",
+            f"Forget everything about this card ({_n(c['total'], 'entry', 'entries')}) "
+            "and rescan it from scratch?\nNo photo is touched. Every shot "
+            "comes back undecided.",
         ) != QMessageBox.StandardButton.Yes:
             return
         n = self._store().delete_volume(self._vol())
         self._rescan_current_source()
-        self.show_toast(f"forgot {n} row(s) · rescanning this card")
+        self.show_toast(f"forgot {_n(n, 'entry', 'entries')} · rescanning this card")
 
     def _do_clear_all(self) -> None:  # pragma: no cover - dialog-bound
         if self._guard_pending_trash("Clear all", None):
             return
         if QMessageBox.warning(
             self, "Clear all",
-            "Reset the ENTIRE database (every card)? This cannot be undone.\n"
-            "No image file is touched. The scan cache is cleared too, so the\n"
-            "next scan of each card re-reads every file (slower, one time).",
+            "Reset the entire database, for every card? This cannot be undone.\n"
+            "No photo is touched. The scan cache goes too, so the next scan\n"
+            "of each card re-reads every file once. That first scan is slower.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
             return
         n = self._store().clear_all()
         self._rescan_current_source()
-        self.show_toast(f"cleared {n} row(s) · rescanning this card")
+        self.show_toast(f"cleared {_n(n, 'entry', 'entries')} · rescanning this card")
 
     def _do_clock_fix(self) -> None:  # pragma: no cover - dialog-bound
         shot = self.session.current
@@ -1157,11 +1173,11 @@ class MainWindow(QMainWindow):
         try:
             true_when = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            self.show_toast("could not parse date/time")
+            self.show_toast("couldn't make sense of that date, use YYYY-MM-DD HH:MM:SS")
             return
         offset = meta.compute_offset(shot.jpg_path, true_when)
         if offset == 0:
-            self.show_toast("no shift needed")
+            self.show_toast("that matches the recorded time already, nothing to shift")
             return
 
         shots = self._store().shots(self._vol())
@@ -1170,8 +1186,9 @@ class MainWindow(QMainWindow):
         sign = "+" if offset >= 0 else "−"
         if QMessageBox.question(
             self, "Fix clock offset",
-            f"Shift AllDates by {sign}{abs(offset)} s across {len(paths)} file(s) "
-            "on this card?\nA _original backup is kept per file (exiftool).",
+            f"Shift every capture date on this card by {sign}{abs(offset)} seconds "
+            f"({_n(len(paths), 'file')})?\nEach file keeps a _original backup, "
+            "so nothing is lost until you verify and clear them.",
         ) != QMessageBox.StandardButton.Yes:
             return
         # Run the shift + re-key + ._ cleanup off the UI thread behind a modal
@@ -1205,7 +1222,8 @@ class MainWindow(QMainWindow):
         if err:
             self.show_toast(f"clock fix failed: {err}")
         else:
-            self.show_toast(f"shifted {n} file(s) · re-keyed rows · cleaned ._ sidecars")
+            self.show_toast(f"shifted {_n(n, 'file')} · every decision kept · "
+                            "._ leftovers cleaned")
 
     def _do_verify_backups(self) -> None:  # pragma: no cover - dialog-bound
         """Check each clock-fix ``_original`` backup against its live photo by
@@ -1219,8 +1237,8 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
             self, "Verify and clear backups",
-            f"Check {len(found)} _original backup(s) against their photos and "
-            "delete those whose image data matches exactly?\n\n"
+            f"Check {_n(len(found), '_original backup')} against the live photos "
+            "and delete the ones that match exactly?\n\n"
             "A backup is removed only when the photo is provably the same image "
             "(only its date changed). Anything that differs is kept and flagged.",
         ) != QMessageBox.StandardButton.Yes:
@@ -1253,20 +1271,21 @@ class MainWindow(QMainWindow):
         are picked up by simply running it again."""
         worker.stop()
         self.show_status(
-            "verify stopped — backups already cleared stay cleared; "
-            "run it again to continue", TEXT_DIM, ms=4000)
+            "verify stopped. anything already cleared stays cleared; "
+            "run it again to finish the rest", TEXT_DIM, ms=4000)
 
     def _on_verify_done(self, res, dlg) -> None:  # pragma: no cover - dialog-bound
         dlg.close()
         self._verify_worker = None
-        msg = f"Cleared {res.reclaimed} verified backup(s)."
+        msg = f"Cleared {_n(res.reclaimed, 'verified backup')}."
         if res.mismatched:
             names = "\n".join("  • " + Path(p).name for p in res.mismatched[:12])
             more = "" if len(res.mismatched) <= 12 else f"\n  …and {len(res.mismatched) - 12} more"
-            msg += (f"\n\n⚠ {len(res.mismatched)} file(s) had DIFFERENT image data and "
-                    f"were KEPT — inspect these:\n{names}{more}")
+            msg += (f"\n\n⚠ {_n(len(res.mismatched), 'file')} had DIFFERENT image "
+                    f"data, so those backups were kept. Take a look at:\n{names}{more}")
         if res.errored:
-            msg += f"\n\n{len(res.errored)} file(s) couldn't be checked (kept)."
+            msg += (f"\n\n{_n(len(res.errored), 'file')} couldn't be checked; "
+                    "those backups were kept too.")
         box = QMessageBox.warning if (res.mismatched or res.errored) else QMessageBox.information
         box(self, "Verify and clear backups", msg)
 
@@ -1350,7 +1369,7 @@ class MainWindow(QMainWindow):
         # Never interrupt a running clock-fix: stopping mid-way would leave the
         # card half-shifted with decisions orphaned. Finish first, then close.
         if self._clock_worker is not None and self._clock_worker.isRunning():
-            self.show_status("clock fix in progress — wait for it to finish",
+            self.show_status("the clock fix is still running, let it finish first",
                              ACCENT_JPG, ms=3000)
             event.ignore()
             return
@@ -1425,7 +1444,7 @@ class SourceDialog(QDialog):
         self.list.clear()
         sources = volume.list_sources()
         if not sources:
-            item = QListWidgetItem("No mounted volumes found — use Browse…")
+            item = QListWidgetItem("No mounted volumes found. Use Browse…")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             item.setForeground(QColor(TEXT_DIM))
             self.list.addItem(item)
@@ -1551,13 +1570,13 @@ class StorageDialog(QDialog):
                 current_size = size
             mark = "   ← the card open now" if is_current else ""
             item = QListWidgetItem(
-                f"{d.name}{mark}\n{len(files)} file(s) · {_human_size(size)}")
+                f"{d.name}{mark}\n{_n(len(files), 'file')} · {_human_size(size)}")
             item.setData(Qt.ItemDataRole.UserRole, str(d))
             if not is_current:
                 item.setForeground(QColor(TEXT_DIM))
             self.list.addItem(item)
         if not dirs:
-            item = QListWidgetItem("Trash is empty — nothing to reclaim.")
+            item = QListWidgetItem("The trash is empty. Nothing to reclaim.")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             item.setForeground(QColor(TEXT_DIM))
             self.list.addItem(item)
