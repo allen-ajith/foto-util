@@ -45,8 +45,14 @@ def live_path(backup: Path) -> Path:
 
 
 def find_backups(root: str | Path) -> list[Path]:
-    """Every exiftool ``*_original`` backup under ``root``."""
-    return sorted(p for p in Path(root).rglob(f"*{BACKUP_SUFFIX}") if p.is_file())
+    """Every exiftool ``*_original`` backup under ``root`` — scoped to the
+    ``DCIM/`` tree when there is one (a card), because that is the only place
+    the clock fix ever writes. Keeps the delete surface to the audited card
+    area; a plain folder source (no ``DCIM``) is searched as given."""
+    root = Path(root)
+    dcim = root / "DCIM"
+    scope = dcim if dcim.is_dir() else root
+    return sorted(p for p in scope.rglob(f"*{BACKUP_SUFFIX}") if p.is_file())
 
 
 def verify_and_remove(

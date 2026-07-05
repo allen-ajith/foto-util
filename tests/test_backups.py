@@ -16,6 +16,24 @@ def test_live_path_strips_the_suffix():
     assert backups.live_path(Path("/c/DSC1.ARW_original")) == Path("/c/DSC1.ARW")
 
 
+def test_find_backups_scopes_to_dcim_on_a_card(card):
+    """On a card, only the DCIM tree is searched — a user's own *_original file
+    elsewhere on the card is not foto-util's to touch. A plain folder source
+    (no DCIM) is searched as given."""
+    inside = card / "DCIM" / "100MSDCF" / "DSC00001.JPG_original"
+    inside.write_bytes(b"x")
+    outside = card / "PRIVATE" / "notes.txt_original"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"x")
+
+    found = backups.find_backups(card)
+    assert inside in found
+    assert outside not in found
+
+    # folder mode: no DCIM/ under the root → the root itself is the scope
+    assert outside in backups.find_backups(card / "PRIVATE")
+
+
 def test_verify_removes_only_image_identical_backups(card):
     if not meta.exiftool_available():
         pytest.skip("exiftool not installed")
