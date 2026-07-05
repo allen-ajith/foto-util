@@ -52,17 +52,28 @@ def test_shift_all_dates_reports_progress_in_batches(card):
     seen: list[tuple[int, int]] = []
     n = meta.shift_all_dates(jpgs, 60, batch=2, progress=lambda d, t: seen.append((d, t)))
     assert n == 3
-    assert seen == [(2, 3), (3, 3)]   # 3 files, batches of 2 → two callbacks, ending at total
+    # 3 files in batches of 2 → two callbacks. Batches run concurrently and
+    # finish in any order, so only monotonic completion is guaranteed.
+    assert len(seen) == 2
+    assert seen[-1] == (3, 3)                       # ends complete
+    dones = [d for d, _ in seen]
+    assert dones == sorted(dones)                   # monotonic progress
+    assert all(t == 3 for _, t in seen)
 
 
-def test_clean_appledouble_removes_only_sidecars(card):
+def test_clean_appledouble_removes_only_sidecars_of_edited_files(card):
+    """Cleanup is scoped to the files a clock-fix touched (and their backups) —
+    never a card-wide sweep that would eat pre-existing ``._`` metadata."""
     folder = card / "DCIM" / "100MSDCF"
     (folder / "._DSC00001.JPG").write_bytes(b"junk")
-    (folder / "._misc").write_bytes(b"junk")
+    (folder / "._DSC00001.JPG_original").write_bytes(b"junk")
+    (folder / "._misc").write_bytes(b"junk")   # not ours — must survive
     real = folder / "DSC00001.JPG"
 
-    n = meta.clean_appledouble(card / "DCIM")
+    n = meta.clean_appledouble([real])
 
     assert n == 2
     assert not (folder / "._DSC00001.JPG").exists()
+    assert not (folder / "._DSC00001.JPG_original").exists()
+    assert (folder / "._misc").exists()  # untouched: we didn't create it
     assert real.exists()              # real images are never touched

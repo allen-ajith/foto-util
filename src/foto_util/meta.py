@@ -159,9 +159,26 @@ import json
 import shutil
 import subprocess
 
+# Generous per-invocation cap: one exiftool call touches at most one batch of
+# files, but a batch of large ARWs on a slow SD reader takes real time. The
+# timeout exists so a hung exiftool can never wedge a worker thread forever.
+_EXIFTOOL_TIMEOUT_S = 600
+
 
 def exiftool_available() -> bool:
     return shutil.which("exiftool") is not None
+
+
+def _run_exiftool(args: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["exiftool", *args],
+            capture_output=True, text=True, timeout=_EXIFTOOL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"exiftool timed out after {_EXIFTOOL_TIMEOUT_S}s"
+        ) from e
 
 
 def image_data_hashes(paths: list[str | Path]) -> dict[str, str]:
@@ -178,9 +195,8 @@ def image_data_hashes(paths: list[str | Path]) -> dict[str, str]:
         return {}
     if not exiftool_available():
         raise RuntimeError("exiftool not found (install with `brew install exiftool`)")
-    proc = subprocess.run(
-        ["exiftool", "-api", "ImageDataHash=sha256", "-j", "-ImageDataHash", *items],
-        capture_output=True, text=True,
+    proc = _run_exiftool(
+        ["-api", "ImageDataHash=sha256", "-j", "-ImageDataHash", *items]
     )
     out: dict[str, str] = {}
     try:
@@ -225,6 +241,7 @@ def shift_all_dates(
     offset_seconds: int,
     *,
     batch: int = 32,
+    workers: int = 3,
     progress: Callable[[int, int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> int:
@@ -233,51 +250,77 @@ def shift_all_dates(
     backup per file (the explicit safety net of this opt-in feature). Returns the
     number of files exiftool reports updated.
 
-    Work is done in batches so a caller can show progress and interrupt *between*
-    batches (each batch is one exiftool call). ``progress(done, total)`` is invoked
-    after each batch; ``should_stop`` is polled before each.
+    Work is split into batches of ``batch`` files (one exiftool call each), and
+    up to ``workers`` batches run concurrently — exiftool's per-file parsing
+    overlaps with the card I/O, which is worth a real fraction of wall time on a
+    slow SD card. Batches are independent (each file is either fully rewritten
+    with its backup, or untouched), so concurrency doesn't change failure
+    behaviour. ``progress(done, total)`` fires as each batch completes; because
+    batches finish out of order, ``done`` is monotonic but its increments vary.
+    ``should_stop`` is polled before *submitting* each batch.
 
     Note: editing a JPEG/ARW changes its bytes and therefore its content hash;
-    callers should re-key affected rows (``Store.rekey``) so decisions survive.
-    Best run before culling.
+    callers should re-key affected rows (see ``indexer.rekey_shifted``) so
+    decisions survive.
     """
     if not paths:
         return 0
     if not exiftool_available():
         raise RuntimeError("exiftool not found (install with `brew install exiftool`)")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     sign, token = _shift_token(offset_seconds)
     total = len(paths)
+    chunks = [
+        [str(p) for p in paths[start : start + batch]]
+        for start in range(0, total, batch)
+    ]
     done = updated = 0
-    for start in range(0, total, batch):
-        if should_stop is not None and should_stop():
-            break
-        chunk = [str(p) for p in paths[start : start + batch]]
-        proc = subprocess.run(
-            ["exiftool", f"-AllDates{sign}={token}", *chunk],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"exiftool failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        m = re.search(r"(\d+) image files updated", proc.stdout)
-        updated += int(m.group(1)) if m else len(chunk)
-        done += len(chunk)
-        if progress is not None:
-            progress(done, total)
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(chunks)))) as pool:
+        futures = {}
+        for chunk in chunks:
+            if should_stop is not None and should_stop():
+                break
+            fut = pool.submit(_run_exiftool, [f"-AllDates{sign}={token}", *chunk])
+            futures[fut] = chunk
+        try:
+            for fut in as_completed(futures):
+                proc = fut.result()
+                chunk = futures[fut]
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"exiftool failed: {proc.stderr.strip() or proc.stdout.strip()}")
+                m = re.search(r"(\d+) image files updated", proc.stdout)
+                updated += int(m.group(1)) if m else len(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        except Exception:
+            for f in futures:
+                f.cancel()          # in-flight batches still finish safely
+            raise
     return updated
 
 
-def clean_appledouble(root: str | Path) -> int:
-    """Delete macOS ``._*`` AppleDouble sidecars under ``root`` and return the
-    count removed. macOS writes these when a file is modified on an exFAT card
-    (e.g. during a clock-fix); they are OS metadata, never image files, so the
-    camera ignores them and removing them just restores the card's tidiness."""
+def clean_appledouble(paths: "list[str | Path]") -> int:
+    """Delete the macOS ``._*`` AppleDouble sidecars *of the given files* (and of
+    their exiftool ``_original`` backups) and return the count removed. macOS
+    writes these when a file is modified on an exFAT card (e.g. during a
+    clock-fix); they are OS metadata, never image files, so the camera ignores
+    them and removing them just undoes the litter the edit caused.
+
+    Deliberately scoped to the edited files only — a blanket sweep of the card
+    would also delete pre-existing ``._`` sidecars the user's own tooling made
+    (Finder tags and the like), which this app has no business touching."""
     removed = 0
-    for p in Path(root).rglob("._*"):
-        try:
-            if p.is_file():
-                p.unlink()
-                removed += 1
-        except OSError:
-            pass
+    for path in paths:
+        p = Path(path)
+        for name in (f"._{p.name}", f"._{p.name}_original"):
+            sidecar = p.parent / name
+            try:
+                if sidecar.is_file():
+                    sidecar.unlink()
+                    removed += 1
+            except OSError:
+                pass
     return removed
