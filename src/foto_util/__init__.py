@@ -6,4 +6,4 @@ each other directly. The single module permitted to mutate the source volume is
 :mod:`foto_util.fileops`.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

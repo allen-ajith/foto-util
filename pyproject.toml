@@ -1,6 +1,6 @@
 [project]
 name = "foto-util"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast, local, keyboard-driven photo culling for Sony RAW+JPEG cards. Non-destructive; never alters the card's structure."
 readme = "README.md"
 requires-python = ">=3.11"
