@@ -161,8 +161,8 @@ class Session:
         if decision is Decision.KEEP_JPG and not (shot.jpg_path and shot.raw_path):
             kind = "JPEG-only" if shot.jpg_path else "RAW-only"
             raise OrphanDecisionError(
-                f"This shot is {kind} — “keep JPEG, drop RAW” needs a RAW+JPEG "
-                "pair. Press 2 to keep it or 3 to delete it."
+                f"This shot is {kind}, so there is no RAW to drop. "
+                "Press 2 to keep it or 3 to delete it."
             )
         # reconcile: undo any prior file moves for this shot before re-deciding
         self._restore_files(shot)
@@ -219,8 +219,8 @@ class Session:
         # "not a regular file" guard error — name the real situation instead.
         if not Path(path).exists():
             raise FileNotFoundError(
-                f"{Path(path).name} is no longer on the card — this entry is "
-                "stale. Database → Prune stale rows cleans it up."
+                f"{Path(path).name} is no longer on the card, so this entry is "
+                "stale. Database → Prune stale rows will clean it up."
             )
         return fileops.stage_move(
             path, self.card_root, self.trash_dir, strict=self.strict

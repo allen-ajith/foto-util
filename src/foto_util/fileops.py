@@ -168,8 +168,8 @@ def restore(trash_path: str | Path, original_path: str | Path) -> Path:
             trash_path.unlink(missing_ok=True)  # idempotent cleanup
             return original
         raise RestoreConflictError(
-            f"a different file now exists at {original} — refusing to overwrite "
-            "it (the trashed copy is kept in the trash)"
+            f"a different file now sits at {original}, so this restore was "
+            "refused. The trashed copy is still safe in the trash"
         )
 
     original.parent.mkdir(parents=True, exist_ok=True)
@@ -232,7 +232,7 @@ def recover_all(
         try:
             if dest.exists() and hash_file(dest) != hash_file(f):
                 errors.append(
-                    (str(f), "card already has a different file here — kept the card version")
+                    (str(f), "the card already has a different file here, so the card version was kept")
                 )
                 continue
             restore(f, dest)   # empty slot → moved back; identical → trash cleaned up

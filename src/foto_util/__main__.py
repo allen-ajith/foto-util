@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         n = indexer.scan(target, store, vol, gap_s=args.scene_gap,
                          progress=_print_progress)
         c = store.counts(vol)
-        print(f"{n} shots — {c['undecided']} undecided, {c['decided']} decided")
+        print(f"{n} shots: {c['undecided']} undecided, {c['decided']} decided")
         print(f"volume: {vol}")
         print(f"card root: {root}  (strict card mode: {strict})")
         store.close()
