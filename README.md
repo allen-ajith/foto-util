@@ -91,7 +91,7 @@ Everything else:
 | `U` | Undo the last decision (brings trashed files back). |
 | `[` / `]` | Jump to the previous / next time group (a scene or burst). |
 | `?` or `H` | Show or hide the on-screen key hints. |
-| `Cmd E` | Eject the card. |
+| `Cmd E` | Eject the card (first offers to sweep macOS `._` sidecar litter off it). |
 
 ## Menus
 
@@ -182,7 +182,10 @@ During culling, the only files foto-util will ever remove are image files inside
 hard-blocked. The clock-fix tools add two narrow, confirmed exceptions on top of that: clearing
 verified `_original` backups (each checked against its live photo first), and removing the
 `._` metadata sidecars macOS creates for the exact files the fix rewrote — never a card-wide
-sweep.
+sweep. Eject adds a third, opt-in exception: it offers (with a count, confirmed each time) to
+remove the macOS `._` sidecar files under `DCIM/` so the card goes back to the camera pristine.
+Those are pure metadata litter macOS writes to exFAT cards — the camera never creates or reads
+them, and the `._` name pattern cannot match a photo.
 
 ## Limitations
 
