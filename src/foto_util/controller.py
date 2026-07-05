@@ -175,11 +175,21 @@ class Session:
                 trash_raw = str(self._move(shot.raw_path))
             self.store.set_decision(shot.hash, Decision.KEEP_JPG, trash_raw=trash_raw)
         elif decision is Decision.REJECT:
-            trash_jpg = str(self._move(shot.jpg_path)) if shot.jpg_path else None
-            trash_raw = str(self._move(shot.raw_path)) if shot.raw_path else None
-            self.store.set_decision(
-                shot.hash, Decision.REJECT, trash_jpg=trash_jpg, trash_raw=trash_raw
-            )
+            # Record whatever actually moved even if the second move fails —
+            # otherwise a JPEG already in the trash would have no trash pointer
+            # (invisible to undo, stranded until a bulk recover).
+            trash_jpg = trash_raw = None
+            try:
+                if shot.jpg_path:
+                    trash_jpg = str(self._move(shot.jpg_path))
+                if shot.raw_path:
+                    trash_raw = str(self._move(shot.raw_path))
+            finally:
+                if trash_jpg or trash_raw:
+                    self.store.set_decision(
+                        shot.hash, Decision.REJECT,
+                        trash_jpg=trash_jpg, trash_raw=trash_raw,
+                    )
         self._refresh_current()
         if advance:
             self.goto_next_undecided()
@@ -204,6 +214,14 @@ class Session:
         return str(self.card_root / rel)
 
     def _move(self, path: str) -> Path:
+        # A stale row (file removed outside the app, or emptied trash that
+        # somehow kept its path) would otherwise surface as a cryptic
+        # "not a regular file" guard error — name the real situation instead.
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"{Path(path).name} is no longer on the card — this entry is "
+                "stale. Database → Prune stale rows cleans it up."
+            )
         return fileops.stage_move(
             path, self.card_root, self.trash_dir, strict=self.strict
         )
@@ -237,7 +255,9 @@ class Session:
         metadata clear dropped their rows). On a clean run (no per-file errors)
         the affected shots are reset to undecided, since their files are present
         again. Returns ``(restored_count, errors)``."""
-        restored, errors = fileops.recover_all(self.trash_dir, self.card_root)
+        restored, errors = fileops.recover_all(
+            self.trash_dir, self.card_root, strict=self.strict
+        )
         if restored and not errors:
             self.store.reset_trashed_decisions(self.volume_id)
         return restored, errors

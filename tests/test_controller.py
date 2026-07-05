@@ -249,3 +249,79 @@ def test_resume_skips_decided_shots(card, store):
     )
     assert resumed.current.decision is None
     assert not resumed.current.jpg_path.endswith("100MSDCF/DSC00001.JPG")
+
+
+def test_partial_reject_records_what_actually_moved(card, store, monkeypatch):
+    """If the second move of a reject fails, the first move must still be
+    recorded (trash pointer set) so the trashed file stays visible to undo
+    instead of being stranded with no database link."""
+    import pytest
+
+    from foto_util import controller, fileops
+
+    s = make_session(card, store)
+    seek(s, "DSC00020.")
+    shot_hash = s.current.hash
+    jpg = card / "DCIM" / "100MSDCF" / "DSC00020.JPG"
+    raw = card / "DCIM" / "100MSDCF" / "DSC00020.ARW"
+    real_stage_move = fileops.stage_move
+
+    def failing_stage_move(src, *a, **k):
+        if str(src).endswith(".ARW"):
+            raise RuntimeError("simulated failure on the RAW")
+        return real_stage_move(src, *a, **k)
+
+    monkeypatch.setattr(controller.fileops, "stage_move", failing_stage_move)
+    with pytest.raises(RuntimeError):
+        s.decide(Decision.REJECT, advance=False)
+
+    row = store.get(shot_hash)
+    assert row.decision is Decision.REJECT
+    assert row.trash_jpg is not None       # the moved JPEG is recorded…
+    assert row.trash_raw is None
+    assert not jpg.exists() and raw.exists()
+
+    # …so undo can bring it straight back.
+    monkeypatch.setattr(controller.fileops, "stage_move", real_stage_move)
+    assert s.undo_last() is True
+    assert jpg.exists() and raw.exists()
+    assert store.get(shot_hash).decision is None
+
+
+def test_empty_trash_finalizes_and_cleans_the_roll(card, store):
+    """The full Empty-trash flow (files gone → pointers/paths cleared → stale
+    rows pruned): rejected shots vanish from the roll, keep-JPEG shots become
+    truthfully JPEG-only — '1' refuses and 'keep both' can no longer resurrect
+    a RAW that was permanently deleted."""
+    import pytest
+
+    from foto_util import fileops, prune
+    from foto_util.controller import OrphanDecisionError
+
+    s = make_session(card, store)
+    seek(s, "DSC00001.")
+    s.decide(Decision.KEEP_JPG, advance=False)   # RAW → trash
+    kept_hash = s.current.hash
+    seek(s, "DSC00020.")
+    s.decide(Decision.REJECT, advance=False)     # JPG+RAW → trash
+    rej_hash = s.current.hash
+
+    # mirror MainWindow._do_empty_trash
+    fileops.empty_trash(s.trash_dir)
+    store.clear_trash_pointers(s.volume_id)
+    prune.prune_stale(store, s.volume_id)
+    s.reload()
+
+    assert store.get(rej_hash) is None                       # off the roll
+    assert all(sh.hash != rej_hash for sh in s.shots)
+    kept = store.get(kept_hash)
+    assert kept.decision is Decision.KEEP_JPG
+    assert kept.jpg_path is not None and kept.raw_path is None
+
+    # re-deciding the survivor is honest now
+    s.index = next(i for i, sh in enumerate(s.shots) if sh.hash == kept_hash)
+    with pytest.raises(OrphanDecisionError):
+        s.decide(Decision.KEEP_JPG, advance=False)           # no pair to choose between
+    s.decide(Decision.KEEP_BOTH, advance=False)              # keeps the one real file
+    kept = store.get(kept_hash)
+    assert kept.decision is Decision.KEEP_BOTH and kept.raw_path is None
